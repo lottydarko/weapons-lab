@@ -39,4 +39,4 @@ This is one simulation of armed men, shared by every enemy class in the city. A 
 - Day stills: one enemy in each state — patrol-carry, aim, fire (muzzle flash visible at the gun), reload — plus one crowd-cost line: frame cost with 40 armed NPCs active.
 - A 3-line report: what you added, which poses you layered, any place the rig fought you.
 
-**Never:** new weapon stats, new rigs, new pose-name changes to existing poses, edits to reference-only files, placeholder boxes as weapons (use the existing carbine mesh path the engine already loads for the player viewmodel, scaled for world use).
+**Never:** new weapon stats, new rigs, new pose-name changes to existing poses, edits to reference-only files, placeholder boxes as weapons. The enemy carbine is built by calling `createSharedWeaponMesh()` from sharedWeapon.ts — the exact builder the player viewmodel uses (one definition: model, behavior, stats). For the black finish: clone the shared materials for NPC instances and tint the clones black — do NOT edit the shared materials in sharedWeapon.ts, or the player's gun changes too.
