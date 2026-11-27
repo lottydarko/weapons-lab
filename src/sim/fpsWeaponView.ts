@@ -3,8 +3,12 @@ import { FPS_EYE_HEIGHT_M, FpsBridgeHooks, FpsRayTarget, TrainFrame } from './fp
 import {
   createSharedWeaponMesh,
   fireSharedWeapon,
-  SHARED_WEAPON_SPEC,
+  getSharedWeaponSpec,
+  SHARED_WEAPON_IDS,
+  SHARED_WEAPON_SPECS,
   SharedWeaponFxPool,
+  type SharedWeaponId,
+  type SharedWeaponSpec,
 } from './sharedWeapon';
 import { CollisionWorld, getDistrictAt } from './mapData';
 
@@ -21,6 +25,10 @@ export interface FpsWeaponViewHandles {
   isDrawn: () => boolean;
   isActive: () => boolean;
   toggleDraw: () => boolean;
+  selectWeapon: (weaponId: SharedWeaponId) => SharedWeaponId;
+  getWeaponId: () => SharedWeaponId;
+  getWeaponSpec: () => SharedWeaponSpec;
+  getAmmoState: () => { ammoInMag: number; magazineSize: number; reloading: boolean };
   triggerFire: () => boolean;
   triggerReload: () => void;
   update: (
@@ -32,8 +40,17 @@ export interface FpsWeaponViewHandles {
   dispose: () => void;
 }
 
+interface WeaponSlotView {
+  id: SharedWeaponId;
+  mesh: THREE.Group;
+  muzzleObj: THREE.Object3D;
+  pumpForend: THREE.Object3D | null;
+  pumpForendRestZ: number;
+}
+
 /**
- * First-person weapons viewmodel + shared weapon firing controller
+ * First-person weapons viewmodel + shared arsenal firing controller
+ * (1 = Service Carbine, 2 = Full-Auto Carbine, 3 = Pump Shotgun)
  * wired strictly through FpsBridgeHooks (active on foot & in train, hidden in car).
  */
 export function createFpsWeaponView(
@@ -49,13 +66,33 @@ export function createFpsWeaponView(
   weaponPivot.position.set(0.21, -0.20, -0.42);
   viewRoot.add(weaponPivot);
 
-  // Shared weapon mesh (identical definition to gang/enemy weapon)
-  const weaponMesh = createSharedWeaponMesh(0.86);
-  // Rotate +Z weapon forward so it points along -Z camera forward
-  weaponMesh.rotation.y = Math.PI;
-  weaponPivot.add(weaponMesh);
+  // Build all 3 canonical player weapon meshes from sharedWeapon.ts (player materials untouched!)
+  const slots: Record<SharedWeaponId, WeaponSlotView> = {} as Record<SharedWeaponId, WeaponSlotView>;
+  const ammoByWeapon: Record<SharedWeaponId, number> = {
+    service_carbine: SHARED_WEAPON_SPECS.service_carbine.magazineSize,
+    full_auto_carbine: SHARED_WEAPON_SPECS.full_auto_carbine.magazineSize,
+    pump_shotgun: SHARED_WEAPON_SPECS.pump_shotgun.magazineSize,
+  };
 
-  // First-person gloved hands & tactical sleeves gripping the shared carbine
+  for (const id of SHARED_WEAPON_IDS) {
+    const mesh = createSharedWeaponMesh(0.86, id);
+    // Rotate +Z weapon forward so it points along -Z camera forward
+    mesh.rotation.y = Math.PI;
+    mesh.visible = id === 'service_carbine';
+    weaponPivot.add(mesh);
+
+    const muzzleObj = mesh.getObjectByName('MuzzleAnchor') ?? mesh;
+    const pumpForend = mesh.getObjectByName('PumpForend') ?? null;
+    slots[id] = {
+      id,
+      mesh,
+      muzzleObj,
+      pumpForend,
+      pumpForendRestZ: pumpForend ? pumpForend.position.z : 0.31,
+    };
+  }
+
+  // First-person gloved hands & tactical sleeves gripping the equipped weapon
   const sleeveMat = new THREE.MeshStandardMaterial({
     color: '#1e242d',
     emissive: '#0c1118',
@@ -96,7 +133,7 @@ export function createFpsWeaponView(
   rightArm.add(rKnuckle);
   weaponPivot.add(rightArm);
 
-  // Left support hand + forearm cupping the carbine handguard
+  // Left support hand + forearm cupping the carbine handguard / shotgun pump forend
   const leftArm = new THREE.Group();
   const lForearm = new THREE.Mesh(new THREE.CylinderGeometry(0.034, 0.043, 0.38, 10), sleeveMat);
   lForearm.rotation.x = Math.PI * 0.41;
@@ -115,17 +152,16 @@ export function createFpsWeaponView(
   leftArm.add(lKnuckle);
   weaponPivot.add(leftArm);
 
-  const muzzleObj = weaponMesh.getObjectByName('MuzzleAnchor') ?? weaponMesh;
-
   // State
+  let currentWeaponId: SharedWeaponId = 'service_carbine';
   let active = false;
   let mode: 'driving' | 'onFoot' | 'train' = 'driving';
   let drawn = true;
   let drawFrac = 0; // 0 = holstered, 1 = ready
   let recoilKick = 0;
   let fireCooldown = 0;
+  let pumpTimer = 0;
   let lastShotAtMs = -Infinity;
-  let ammoInMag = SHARED_WEAPON_SPEC.magazineSize;
   let reloadTimer = 0;
   let swayPhase = 0;
   let trainSpeedMps = 0;
@@ -134,6 +170,41 @@ export function createFpsWeaponView(
 
   const _rayDir = new THREE.Vector3();
   const _muzzleWorld = new THREE.Vector3();
+
+  const selectWeapon = (weaponId: SharedWeaponId): SharedWeaponId => {
+    if (!slots[weaponId]) return currentWeaponId;
+    if (weaponId === currentWeaponId) return currentWeaponId;
+
+    // Reset previous slot's pump forend to rest before hiding
+    const prevSlot = slots[currentWeaponId];
+    if (prevSlot.pumpForend) {
+      prevSlot.pumpForend.position.z = prevSlot.pumpForendRestZ;
+    }
+    prevSlot.mesh.visible = false;
+
+    currentWeaponId = weaponId;
+    slots[currentWeaponId].mesh.visible = true;
+    reloadTimer = 0;
+    pumpTimer = 0;
+    fireCooldown = 0.14;
+    recoilKick = 0;
+    drawn = true;
+    drawFrac = Math.min(drawFrac, 0.12);
+    return currentWeaponId;
+  };
+
+  // Direct 1 / 2 / 3 weapon switching (no inventory UI or system)
+  const onKeyDown = (e: KeyboardEvent) => {
+    if (!active) return;
+    const tag = (e.target as HTMLElement | null)?.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    if (e.key === '1') selectWeapon('service_carbine');
+    else if (e.key === '2') selectWeapon('full_auto_carbine');
+    else if (e.key === '3') selectWeapon('pump_shotgun');
+  };
+  if (typeof window !== 'undefined') {
+    window.addEventListener('keydown', onKeyDown);
+  }
 
   const hooks: FpsBridgeHooks = {
     onEnterOnFoot: (_spawnPos: THREE.Vector3, _yaw: number) => {
@@ -169,6 +240,7 @@ export function createFpsWeaponView(
       active = false;
       drawFrac = 0;
       recoilKick = 0;
+      pumpTimer = 0;
       viewRoot.visible = false;
     },
     getRayTargets: callbacks.getRayTargets,
@@ -181,46 +253,54 @@ export function createFpsWeaponView(
   };
 
   const triggerReload = () => {
+    const spec = getSharedWeaponSpec(currentWeaponId);
     if (!active || !drawn || reloadTimer > 0) return;
-    if (ammoInMag >= SHARED_WEAPON_SPEC.magazineSize) return;
-    reloadTimer = SHARED_WEAPON_SPEC.reloadSec;
+    if (ammoByWeapon[currentWeaponId] >= spec.magazineSize) return;
+    reloadTimer = spec.reloadSec;
+    pumpTimer = 0;
   };
 
   const triggerFire = (): boolean => {
+    const spec = getSharedWeaponSpec(currentWeaponId);
     if (!active || !drawn || drawFrac < 0.72 || reloadTimer > 0 || fireCooldown > 0) {
       return false;
     }
     // Wall-clock rate gate: no input path (click, hold, gamepad, duplicate
-    // handler) can ever stack two shots inside one fire interval — one press
-    // is one shot, holding is a steady stream at the rated fire rate.
+    // handler) can ever stack two shots inside one fire interval.
     const nowMs = performance.now();
-    if (nowMs - lastShotAtMs < 1000 / SHARED_WEAPON_SPEC.fireRateHz) {
+    if (nowMs - lastShotAtMs < 1000 / spec.fireRateHz) {
       return false;
     }
-    if (ammoInMag <= 0) {
+    if (ammoByWeapon[currentWeaponId] <= 0) {
       triggerReload();
       return false;
     }
 
-    ammoInMag--;
+    ammoByWeapon[currentWeaponId]--;
     lastShotAtMs = nowMs;
-    fireCooldown = 1 / SHARED_WEAPON_SPEC.fireRateHz;
-    recoilKick = Math.min(1.0, recoilKick + 0.65);
+    fireCooldown = 1 / spec.fireRateHz;
 
+    if (currentWeaponId === 'pump_shotgun') {
+      recoilKick = Math.min(1.45, recoilKick + 1.25);
+      pumpTimer = spec.pumpCycleSec;
+    } else if (currentWeaponId === 'full_auto_carbine') {
+      recoilKick = Math.min(0.95, recoilKick + 0.44);
+    } else {
+      recoilKick = Math.min(1.0, recoilKick + 0.65);
+    }
+
+    const activeSlot = slots[currentWeaponId];
     camera.getWorldDirection(_rayDir);
-    muzzleObj.getWorldPosition(_muzzleWorld);
+    activeSlot.muzzleObj.getWorldPosition(_muzzleWorld);
     if (
       !Number.isFinite(_muzzleWorld.x + _muzzleWorld.y + _muzzleWorld.z) ||
       _muzzleWorld.distanceToSquared(camera.position) > 9
     ) {
-      // Muzzle node's world matrix was stale (mode switch / pre-render frame):
-      // anchor the tracer to the eye so a shot can never appear to come from
-      // the sky or from world origin.
       _muzzleWorld.copy(camera.position).addScaledVector(_rayDir, 0.45);
       _muzzleWorld.y -= 0.12;
     }
 
-    const targets = hooks.getRayTargets(camera.position, SHARED_WEAPON_SPEC.rangeM);
+    const targets = hooks.getRayTargets(camera.position, spec.rangeM);
     const distTag = getDistrictAt(camera.position.x, camera.position.z).slice(0, 3).trim();
 
     const hit = fireSharedWeapon({
@@ -229,21 +309,30 @@ export function createFpsWeaponView(
       dir: _rayDir,
       shooterKind: 'player',
       shooterId: 'player',
-      spreadRad: SHARED_WEAPON_SPEC.playerSpreadRad,
+      spreadRad: spec.playerSpreadRad,
       rayTargets: targets,
       collisionWorld: callbacks.collisionWorld,
       fxPool: callbacks.fxPool,
       districtId: distTag,
       onSound: () => callbacks.onPlayShotSound(),
       listenerPos: camera.position,
+      weaponId: currentWeaponId,
     });
 
-    if (hit.hit && hit.kind === 'npc' && hit.agentId) {
+    if (hit.hits && hit.hits.length > 0) {
+      for (let i = 0; i < hit.hits.length; i++) {
+        const ph = hit.hits[i];
+        if (ph.kind === 'npc' && ph.agentId) {
+          callbacks.onHitNpc(ph.agentId, ph.damage, camera.position);
+        }
+      }
+    } else if (hit.hit && hit.kind === 'npc' && hit.agentId) {
       callbacks.onHitNpc(hit.agentId, hit.damage, camera.position);
     }
 
-    if (ammoInMag <= 0) {
-      reloadTimer = SHARED_WEAPON_SPEC.reloadSec;
+    if (ammoByWeapon[currentWeaponId] <= 0) {
+      reloadTimer = spec.reloadSec;
+      pumpTimer = 0;
     }
     return true;
   };
@@ -259,18 +348,29 @@ export function createFpsWeaponView(
       return;
     }
 
+    const spec = getSharedWeaponSpec(currentWeaponId);
+    const activeSlot = slots[currentWeaponId];
+
     fireCooldown = Math.max(0, fireCooldown - dt);
+    if (pumpTimer > 0) {
+      pumpTimer = Math.max(0, pumpTimer - dt);
+    }
     if (reloadTimer > 0) {
       reloadTimer = Math.max(0, reloadTimer - dt);
       if (reloadTimer === 0) {
-        ammoInMag = SHARED_WEAPON_SPEC.magazineSize;
+        ammoByWeapon[currentWeaponId] = spec.magazineSize;
       }
     }
 
     const targetDraw = drawn ? 1.0 : 0.0;
     const drawRate = drawn ? 6.5 : 8.0;
     drawFrac = THREE.MathUtils.damp(drawFrac, targetDraw, drawRate, dt);
-    recoilKick = THREE.MathUtils.damp(recoilKick, 0, 14.0, dt);
+    recoilKick = THREE.MathUtils.damp(
+      recoilKick,
+      0,
+      currentWeaponId === 'pump_shotgun' ? 9.5 : 14.0,
+      dt
+    );
 
     viewRoot.visible = drawFrac > 0.02;
     if (!viewRoot.visible) return;
@@ -286,19 +386,53 @@ export function createFpsWeaponView(
         ? THREE.MathUtils.clamp(-trainYawRate * 0.04, -0.025, 0.025) +
           Math.sin(elapsed * 4.2) * 0.003 * trainNorm
         : 0;
-    const reloadDip = reloadTimer > 0 ? Math.sin((reloadTimer / SHARED_WEAPON_SPEC.reloadSec) * Math.PI) * 0.12 : 0;
+    const reloadU = reloadTimer > 0 ? 1 - reloadTimer / spec.reloadSec : 0;
+    const reloadDip = reloadTimer > 0 ? Math.sin(reloadU * Math.PI) * 0.12 : 0;
     const holsterDrop = (1 - drawFrac) * 0.34;
     const seatedOffsetY = trainSeated ? -0.015 : 0;
 
+    // Pump shotgun forend + support hand stroke coupled cleanly to the 0.9 Hz shot cycle
+    // (also performs a crisp final rack at the end of a 3.2s shell reload!)
+    let pumpStroke = 0; // 0 = forward locked, 1 = pulled fully rearward
+    let pumpTilt = 0;
+    if (currentWeaponId === 'pump_shotgun') {
+      if (pumpTimer > 0 && spec.pumpCycleSec > 0) {
+        const u = 1.0 - pumpTimer / spec.pumpCycleSec; // 0..1 across shot cycle
+        if (u > 0.16 && u < 0.78) {
+          const p = (u - 0.16) / 0.62;
+          // Crisp pull back (0..0.46) -> quick pause -> slam forward (0.56..1.0)
+          pumpStroke = p < 0.5 ? Math.sin(p * Math.PI) : Math.sin(p * Math.PI);
+          pumpTilt = Math.sin(p * Math.PI);
+        }
+      } else if (reloadTimer > 0 && reloadU > 0.78 && reloadU < 0.96) {
+        const p = (reloadU - 0.78) / 0.18;
+        pumpStroke = Math.sin(p * Math.PI);
+        pumpTilt = pumpStroke * 0.8;
+      }
+
+      if (activeSlot.pumpForend) {
+        activeSlot.pumpForend.position.z = activeSlot.pumpForendRestZ - pumpStroke * 0.098;
+      }
+      // Left hand sits slightly farther forward on the shotgun pump and slides back with it
+      leftArm.position.set(0, -0.008, -0.022 + pumpStroke * 0.084);
+    } else {
+      leftArm.position.set(0, 0, 0);
+    }
+
+    const recoilPitch =
+      currentWeaponId === 'pump_shotgun' ? recoilKick * 0.145 : recoilKick * 0.085;
+    const recoilBack =
+      currentWeaponId === 'pump_shotgun' ? recoilKick * 0.072 : recoilKick * 0.048;
+
     weaponPivot.position.set(
-      0.205 + bobX + trainSwayX,
-      -0.195 + bobY - holsterDrop - reloadDip + seatedOffsetY + recoilKick * 0.012,
-      -0.41 + recoilKick * 0.048
+      0.205 + bobX + trainSwayX - pumpTilt * 0.012,
+      -0.195 + bobY - holsterDrop - reloadDip + seatedOffsetY + recoilKick * 0.014 - pumpTilt * 0.01,
+      -0.41 + recoilBack + pumpStroke * 0.014
     );
     weaponPivot.rotation.set(
-      recoilKick * 0.085 - (1 - drawFrac) * 0.58 - reloadDip * 1.4,
-      trainSwayX * 0.65,
-      -recoilKick * 0.035 - (1 - drawFrac) * 0.24
+      recoilPitch - (1 - drawFrac) * 0.58 - reloadDip * 1.4 + pumpTilt * 0.065,
+      trainSwayX * 0.65 - pumpTilt * 0.04,
+      -recoilKick * 0.035 - (1 - drawFrac) * 0.24 + pumpTilt * 0.16
     );
   };
 
@@ -307,10 +441,21 @@ export function createFpsWeaponView(
     isDrawn: () => drawn && active,
     isActive: () => active,
     toggleDraw,
+    selectWeapon,
+    getWeaponId: () => currentWeaponId,
+    getWeaponSpec: () => getSharedWeaponSpec(currentWeaponId),
+    getAmmoState: () => ({
+      ammoInMag: ammoByWeapon[currentWeaponId],
+      magazineSize: getSharedWeaponSpec(currentWeaponId).magazineSize,
+      reloading: reloadTimer > 0,
+    }),
     triggerFire,
     triggerReload,
     update,
     dispose: () => {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('keydown', onKeyDown);
+      }
       camera.remove(viewRoot);
     },
   };

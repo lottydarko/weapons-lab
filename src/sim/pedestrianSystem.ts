@@ -17,13 +17,27 @@ import { MetroStationRuntimeInfo } from './metroSystem';
 import { TextureLibrary } from './textures';
 import {
   applyClothWindShader,
+  createEnemyCarbineVisual,
+  disposeEnemyCarbineVisual,
+  EnemyCarbineVisual,
+  EnemyWeaponClass,
+  EnemyWeaponState,
+  evaluateReloadChoreography,
+  getEnemyWeaponClassProfile,
+  getEnemyWeaponIdForClass,
   getSharedHumanGeometries,
+  MuzzleFlashLightPool,
+  setEnemyCarbineMagOffset,
+  setEnemyWeaponPumpStroke,
+  triggerEnemyCarbineFlash,
+  updateEnemyCarbineVisual,
 } from './humanCharacter';
 import {
-  createSharedWeaponMesh,
   fireSharedWeapon,
+  getSharedWeaponSpec,
   SHARED_WEAPON_SPEC,
   SharedWeaponFxPool,
+  type SharedWeaponId,
 } from './sharedWeapon';
 import { worldEventBus } from './worldEventBus';
 
@@ -115,6 +129,22 @@ export interface PedAgent {
   burstShotsLeft: number;
   burstShotTimer: number;
   aiming: boolean;
+  // Enemy weapon interaction & animation state (data-driven via ENEMY_CLASS_WEAPON_TABLE)
+  weaponClass: EnemyWeaponClass;
+  weaponId: SharedWeaponId;
+  weaponState: EnemyWeaponState;
+  ammoInMag: number;
+  reloadTimer: number;
+  drawFrac: number;
+  aimBlend: number;
+  twoHandBlend: number;
+  lowReadyBlend: number;
+  reloadBlend: number;
+  recoilKick: number;
+  aimPitch: number;
+  ledTarget: number;
+  lastShotElapsed: number;
+  hadFireLos: boolean;
 }
 
 export interface PedPlayerContext {
@@ -474,10 +504,12 @@ export function buildPedestrianSystem(
 
   const weaponFxPool = new SharedWeaponFxPool(24);
   root.add(weaponFxPool.root);
+  const muzzleLightPool = new MuzzleFlashLightPool(4);
+  root.add(muzzleLightPool.root);
   const { questionSteps, alertBang } = getSuspicionTextures();
   const gangVisuals = new Map<
     number,
-    { weapon: THREE.Group; suspicionSprite: THREE.Sprite }
+    { carbine: EnemyCarbineVisual; suspicionSprite: THREE.Sprite }
   >();
 
   const spawnAgents = () => {
@@ -574,6 +606,21 @@ export function buildPedestrianSystem(
         burstShotsLeft: 0,
         burstShotTimer: 0,
         aiming: false,
+        weaponClass: civClass === 'transit_guard' ? 'guard' : 'gang',
+        weaponId: 'service_carbine',
+        weaponState: 'patrol',
+        ammoInMag: SHARED_WEAPON_SPEC.magazineSize,
+        reloadTimer: 0,
+        drawFrac: 0,
+        aimBlend: 0,
+        twoHandBlend: 0,
+        lowReadyBlend: 0,
+        reloadBlend: 0,
+        recoilKick: 0,
+        aimPitch: 0,
+        ledTarget: 0,
+        lastShotElapsed: -99,
+        hadFireLos: false,
       };
     };
 
@@ -709,7 +756,8 @@ export function buildPedestrianSystem(
     // 5. 2059 RUSSIA GANG CREWS (Crews of 3-5 in D8 Black Market Quay & D1 Nightlife)
     crews.length = 0;
     gangVisuals.forEach((v) => {
-      root.remove(v.weapon);
+      root.remove(v.carbine.root);
+      disposeEnemyCarbineVisual(v.carbine);
       root.remove(v.suspicionSprite);
     });
     gangVisuals.clear();
@@ -723,6 +771,20 @@ export function buildPedestrianSystem(
         const rad = 2.0 + (m % 2) * 1.4;
         ag.crewIdx = cIdx;
         ag.memberSlot = m;
+        // Data-driven class assignment via ENEMY_CLASS_WEAPON_TABLE:
+        // guards -> Service Carbine, mob enforcers -> Full-Auto Carbine, heavy/brute -> Pump Shotgun
+        ag.weaponClass =
+          m === 0
+            ? 'enforcer'
+            : m === 1
+            ? 'heavy'
+            : m === 2
+            ? 'guard'
+            : m === 3
+            ? 'brute'
+            : 'gang';
+        ag.weaponId = getEnemyWeaponIdForClass(ag.weaponClass);
+        ag.ammoInMag = getSharedWeaponSpec(ag.weaponId).magazineSize;
         ag.formOffX = Math.cos(angle) * rad;
         ag.formOffZ = Math.sin(angle) * rad;
         ag.x = terr.anchorX + ag.formOffX;
@@ -738,9 +800,9 @@ export function buildPedestrianSystem(
         agents.push(ag);
         memberIndices.push(idx);
 
-        // Shared weapon in hand + filling "?" suspicion sprite above head
-        const weapon = createSharedWeaponMesh(0.95);
-        root.add(weapon);
+        // Black cloned enemy variation of the class weapon with red warm-up LED + muzzle flash
+        const carbine = createEnemyCarbineVisual(0.95, ag.weaponId);
+        root.add(carbine.root);
         const spriteMat = new THREE.SpriteMaterial({
           map: questionSteps[0],
           transparent: true,
@@ -752,7 +814,7 @@ export function buildPedestrianSystem(
         suspicionSprite.visible = false;
         suspicionSprite.renderOrder = 10;
         root.add(suspicionSprite);
-        gangVisuals.set(idx, { weapon, suspicionSprite });
+        gangVisuals.set(idx, { carbine, suspicionSprite });
       }
       crews.push({
         id: terr.id,
@@ -980,8 +1042,36 @@ export function buildPedestrianSystem(
 
   applyOutfitColors();
 
-  // Zero-GC reusable transform objects
+  // Zero-GC reusable transform & 2-bone arm IK scratch objects
   const dummy = new THREE.Object3D();
+  const _ikRel = new THREE.Vector3();
+  const _ikDir = new THREE.Vector3();
+  const _ikPole = new THREE.Vector3();
+  const _ikBend = new THREE.Vector3();
+  const _ikElbow = new THREE.Vector3();
+  const _ikWrist = new THREE.Vector3();
+  const _ikUpperDir = new THREE.Vector3();
+  const _ikForeDir = new THREE.Vector3();
+  const _ikAxisX = new THREE.Vector3();
+  const _ikAxisY = new THREE.Vector3();
+  const _ikAxisZ = new THREE.Vector3();
+  const _ikMat = new THREE.Matrix4();
+  const _ikQuat = new THREE.Quaternion();
+  const _ikScale = new THREE.Vector3();
+  const _gunEuler = new THREE.Euler(0, 0, 0, 'YXZ');
+  const _gunQuat = new THREE.Quaternion();
+  const _gunPos = new THREE.Vector3();
+  const _rShPos = new THREE.Vector3();
+  const _lShPos = new THREE.Vector3();
+  const _rHandTarget = new THREE.Vector3();
+  const _lHandTarget = new THREE.Vector3();
+  const _lHandBasePos = new THREE.Vector3();
+  const _rPoleHint = new THREE.Vector3();
+  const _lPoleHint = new THREE.Vector3();
+  const _relHandLocal = new THREE.Vector3();
+  const _relMagOffset = new THREE.Vector3();
+  const _relTilt = { roll: 0, pitch: 0, yaw: 0, impulse: 0, pumpStroke: 0 };
+  const _tmpOffset = new THREE.Vector3();
 
   const setPart = (
     inst: THREE.InstancedMesh,
@@ -1001,6 +1091,91 @@ export function buildPedestrianSystem(
     dummy.scale.set(sx, sy, sz);
     dummy.updateMatrix();
     inst.setMatrixAt(idx, dummy.matrix);
+  };
+
+  /** Orient an instanced limb mesh (whose bone runs along local -Y) from startPos along unitDir */
+  const setLimbAligned = (
+    inst: THREE.InstancedMesh,
+    idx: number,
+    startPos: THREE.Vector3,
+    unitDir: THREE.Vector3,
+    fwdHint: THREE.Vector3,
+    sx: number,
+    sy: number,
+    sz: number
+  ) => {
+    _ikAxisY.copy(unitDir).negate();
+    _ikAxisZ.copy(fwdHint).addScaledVector(_ikAxisY, -fwdHint.dot(_ikAxisY));
+    if (_ikAxisZ.lengthSq() < 1e-6) {
+      _ikAxisZ.set(0, 0, 1);
+      _ikAxisZ.addScaledVector(_ikAxisY, -_ikAxisZ.dot(_ikAxisY));
+    }
+    _ikAxisZ.normalize();
+    _ikAxisX.crossVectors(_ikAxisY, _ikAxisZ).normalize();
+    _ikAxisZ.crossVectors(_ikAxisX, _ikAxisY).normalize();
+    _ikMat.makeBasis(_ikAxisX, _ikAxisY, _ikAxisZ);
+    _ikQuat.setFromRotationMatrix(_ikMat);
+    _ikScale.set(sx, sy, sz);
+    _ikMat.compose(startPos, _ikQuat, _ikScale);
+    inst.setMatrixAt(idx, _ikMat);
+  };
+
+  /** Zero-GC 3D 2-bone analytical arm IK placing upper arm, forearm & hand onto a world grip target */
+  const solveInstancedArmIK = (
+    upperInst: THREE.InstancedMesh,
+    foreInst: THREE.InstancedMesh,
+    handInst: THREE.InstancedMesh,
+    idx: number,
+    shoulderPos: THREE.Vector3,
+    handPalmTarget: THREE.Vector3,
+    poleHint: THREE.Vector3,
+    uArmLen: number,
+    fArmLen: number,
+    bScale: number,
+    hScale: number
+  ) => {
+    // Hand geometry palm sits ~0.048*hScale down from wrist along forearm axis
+    const effForeLen = fArmLen + 0.048 * hScale;
+    _ikRel.copy(handPalmTarget).sub(shoulderPos);
+    const rawDist = _ikRel.length();
+    const minDist = Math.abs(uArmLen - effForeLen) + 0.04 * hScale;
+    const maxDist = uArmLen + effForeLen - 0.008 * hScale;
+    const dist = THREE.MathUtils.clamp(rawDist, minDist, maxDist);
+
+    if (rawDist < 1e-4) {
+      _ikDir.set(0, -1, 0);
+    } else {
+      _ikDir.copy(_ikRel).multiplyScalar(1 / rawDist);
+    }
+
+    const cosA = THREE.MathUtils.clamp(
+      (uArmLen * uArmLen + dist * dist - effForeLen * effForeLen) / (2 * uArmLen * dist),
+      -1,
+      1
+    );
+    const sinA = Math.sqrt(Math.max(0, 1 - cosA * cosA));
+
+    _ikPole.copy(poleHint).normalize();
+    _ikBend.copy(_ikPole).addScaledVector(_ikDir, -_ikPole.dot(_ikDir));
+    if (_ikBend.lengthSq() < 1e-5) {
+      _ikBend.set(0, -1, 0);
+    } else {
+      _ikBend.normalize();
+    }
+
+    _ikElbow
+      .copy(shoulderPos)
+      .addScaledVector(_ikDir, uArmLen * cosA)
+      .addScaledVector(_ikBend, uArmLen * sinA);
+
+    _ikUpperDir.copy(_ikElbow).sub(shoulderPos).normalize();
+    _ikForeDir.copy(shoulderPos).addScaledVector(_ikDir, dist).sub(_ikElbow).normalize();
+    _ikWrist.copy(_ikElbow).addScaledVector(_ikForeDir, fArmLen);
+
+    // Orient upper arm, forearm & hand seamlessly along the solved 3D chain
+    setLimbAligned(upperInst, idx, shoulderPos, _ikUpperDir, _ikForeDir, bScale, hScale, bScale);
+    setLimbAligned(foreInst, idx, _ikElbow, _ikForeDir, _ikBend, bScale, hScale, bScale);
+    setLimbAligned(handInst, idx, _ikWrist, _ikForeDir, _ikBend, hScale, hScale, hScale);
   };
 
   const walkingFlags = new Uint8Array(Math.max(1, totalCount));
@@ -1207,6 +1382,8 @@ export function buildPedestrianSystem(
   const _shotMuzzle = new THREE.Vector3();
   const _shotDir = new THREE.Vector3();
   const _playerHitBox = new THREE.Box3();
+  const _playerBoxMin = new THREE.Vector3();
+  const _playerBoxMax = new THREE.Vector3();
   const _playerPosVec = new THREE.Vector3();
 
   const alertCrew = (crewIdx: number, px: number, pz: number, propagate: boolean) => {
@@ -1317,6 +1494,7 @@ export function buildPedestrianSystem(
   ) => {
     const safeDt = Math.min(0.05, Math.max(0.0005, dt));
     weaponFxPool.update(safeDt);
+    muzzleLightPool.update(safeDt);
 
     const playerCtx: PedPlayerContext | undefined =
       playerPosOrCtx instanceof THREE.Vector3
@@ -1325,10 +1503,9 @@ export function buildPedestrianSystem(
     const playerPos = playerCtx?.pos;
     if (playerPos) {
       _playerPosVec.copy(playerPos);
-      _playerHitBox.set(
-        new THREE.Vector3(playerPos.x - 0.55, playerPos.y, playerPos.z - 0.55),
-        new THREE.Vector3(playerPos.x + 0.55, playerPos.y + 1.75, playerPos.z + 0.55)
-      );
+      _playerBoxMin.set(playerPos.x - 0.55, playerPos.y, playerPos.z - 0.55);
+      _playerBoxMax.set(playerPos.x + 0.55, playerPos.y + 1.75, playerPos.z + 0.55);
+      _playerHitBox.set(_playerBoxMin, _playerBoxMax);
     }
 
     // Drain world event bus -> civilians flee gunfire & scatter from chases (gang members never flee!)
@@ -1397,6 +1574,19 @@ export function buildPedestrianSystem(
             ag.z = crew.homeAnchorZ + ag.formOffZ;
             ag.suspicion = 0;
             ag.alertBannerTimer = 0;
+            ag.ammoInMag = getSharedWeaponSpec(ag.weaponId).magazineSize;
+            ag.reloadTimer = 0;
+            ag.burstShotsLeft = 0;
+            ag.weaponState = 'patrol';
+            ag.drawFrac = 0;
+            ag.aimBlend = 0;
+            ag.twoHandBlend = 0;
+            ag.lowReadyBlend = 0;
+            ag.reloadBlend = 0;
+            ag.recoilKick = 0;
+            ag.aimPitch = 0;
+            ag.ledTarget = 0;
+            ag.hadFireLos = false;
           }
           continue;
         }
@@ -1616,73 +1806,198 @@ export function buildPedestrianSystem(
           const groundY = Math.max(0.08, getTerrainHeight(ag.x, ag.z));
           ag.y = crew.districtId === 'D8' && ag.x > 1560 ? Math.max(groundY, 1.52) : groundY;
 
-          // Face player & fire shared weapon during alert chase!
+          const prof = getEnemyWeaponClassProfile(ag.weaponClass);
+          const wSpec = getSharedWeaponSpec(ag.weaponId);
+          ag.hadFireLos = false;
+
+          // Tick active magazine/shell reload (duration strictly equals wSpec.reloadSec)
+          if (ag.reloadTimer > 0) {
+            ag.reloadTimer = Math.max(0, ag.reloadTimer - safeDt);
+            if (ag.reloadTimer === 0) {
+              ag.ammoInMag = wSpec.magazineSize;
+            }
+          }
+
+          // Face player & fire shared arsenal during alert chase (armed walk AND run supported!)
           if (crew.state === 'alert' && playerPos) {
             const toPx = playerPos.x - ag.x;
             const toPz = playerPos.z - ag.z;
             const pDist = Math.hypot(toPx, toPz);
             const hasLos =
-              pDist < 32 &&
+              pDist < Math.min(34, wSpec.rangeM) &&
               (!collisionWorld || collisionWorld.hasLineOfSight(ag.x, ag.z, playerPos.x, playerPos.z));
             if (hasLos) {
+              ag.hadFireLos = true;
               ag.heading = Math.atan2(toPx, toPz);
-              ag.aiming = true;
+              const eyeY = ag.y + 1.44 * ag.heightScale;
+              const desiredPitch = THREE.MathUtils.clamp(
+                Math.atan2(playerPos.y + 1.15 - eyeY, Math.max(0.5, pDist)),
+                -0.55,
+                0.55
+              );
+              ag.aimPitch = THREE.MathUtils.damp(ag.aimPitch, desiredPitch, 12.0, safeDt);
 
-              if (ag.burstShotsLeft > 0) {
-                ag.burstShotTimer -= safeDt;
-                if (ag.burstShotTimer <= 0) {
-                  ag.burstShotsLeft--;
-                  ag.burstShotTimer = 1 / SHARED_WEAPON_SPEC.fireRateHz;
+              if (ag.reloadTimer <= 0) {
+                if (ag.ammoInMag <= 0) {
+                  ag.reloadTimer = wSpec.reloadSec;
+                  ag.burstShotsLeft = 0;
+                } else {
+                  ag.aiming = true;
 
-                  const eyeY = ag.y + 1.44 * ag.heightScale;
-                  _shotOrigin.set(ag.x, eyeY, ag.z);
-                  const sinH = Math.sin(ag.heading);
-                  const cosH = Math.cos(ag.heading);
-                  _shotMuzzle.set(
-                    ag.x + sinH * 0.72 - cosH * 0.18,
-                    ag.y + 1.38 * ag.heightScale,
-                    ag.z + cosH * 0.72 + sinH * 0.18
-                  );
-                  _shotDir.set(
-                    playerPos.x - ag.x,
-                    playerPos.y + 1.15 - eyeY,
-                    playerPos.z - ag.z
-                  );
+                  // Sustained full-auto fires continuously at 11 Hz with no burst pause until mag empty!
+                  if (wSpec.sustainedFire && ag.burstShotsLeft <= 0) {
+                    ag.burstShotsLeft = ag.ammoInMag;
+                    ag.burstCooldown = 0;
+                  }
 
-                  const hit = fireSharedWeapon({
-                    origin: _shotOrigin,
-                    muzzleWorld: _shotMuzzle,
-                    dir: _shotDir,
-                    shooterKind: 'gang',
-                    shooterId: ag.id,
-                    spreadRad: SHARED_WEAPON_SPEC.npcSpreadRad,
-                    rayTargets: [],
-                    collisionWorld,
-                    playerHitBox: _playerHitBox,
-                    fxPool: weaponFxPool,
-                    districtId: crew.districtId,
-                    onSound: playerCtx?.onGunshotSound,
-                    listenerPos: _playerPosVec,
-                  });
-                  if (hit.hit && hit.kind === 'player' && playerCtx?.onPlayerHit) {
-                    playerCtx.onPlayerHit(playerCtx.inVehicle ? hit.damage * 0.22 : hit.damage * 0.45);
+                  if (ag.burstShotsLeft > 0) {
+                    ag.burstShotTimer -= safeDt;
+                    if (ag.burstShotTimer <= 0) {
+                      ag.burstShotsLeft--;
+                      ag.burstShotTimer = 1 / wSpec.fireRateHz;
+                      ag.ammoInMag = Math.max(0, ag.ammoInMag - 1);
+                      const kickBase =
+                        ag.weaponId === 'pump_shotgun'
+                          ? 1.15
+                          : ag.weaponId === 'full_auto_carbine'
+                          ? 0.48
+                          : 0.72;
+                      ag.recoilKick = Math.min(1.35, ag.recoilKick + kickBase * prof.recoilAmp);
+                      ag.lastShotElapsed = elapsed;
+
+                      _shotOrigin.set(ag.x, eyeY, ag.z);
+                      const sinH = Math.sin(ag.heading);
+                      const cosH = Math.cos(ag.heading);
+                      const cosP = Math.cos(ag.aimPitch);
+                      const sinP = Math.sin(ag.aimPitch);
+                      const gvShot = gangVisuals.get(i);
+                      const muzzleZ = (gvShot?.carbine.muzzleLocalPos.z ?? 0.625) * 0.95;
+                      // Visual muzzle agrees with ag.y + 1.38*heightScale & live weapon barrel tip
+                      _shotMuzzle.set(
+                        ag.x + sinH * (0.145 + muzzleZ * cosP) - cosH * 0.175 * ag.buildScale,
+                        ag.y + (1.38 + muzzleZ * sinP) * ag.heightScale,
+                        ag.z + cosH * (0.145 + muzzleZ * cosP) + sinH * 0.175 * ag.buildScale
+                      );
+                      if (gvShot) {
+                        triggerEnemyCarbineFlash(gvShot.carbine, muzzleLightPool, _shotMuzzle);
+                      }
+
+                      _shotDir.set(
+                        playerPos.x - ag.x,
+                        playerPos.y + 1.15 - eyeY,
+                        playerPos.z - ag.z
+                      );
+
+                      const hit = fireSharedWeapon({
+                        origin: _shotOrigin,
+                        muzzleWorld: _shotMuzzle,
+                        dir: _shotDir,
+                        shooterKind: 'gang',
+                        shooterId: ag.id,
+                        spreadRad: wSpec.npcSpreadRad,
+                        rayTargets: [],
+                        collisionWorld,
+                        playerHitBox: _playerHitBox,
+                        fxPool: weaponFxPool,
+                        districtId: crew.districtId,
+                        onSound: playerCtx?.onGunshotSound,
+                        listenerPos: _playerPosVec,
+                        weaponId: ag.weaponId,
+                      });
+                      if (hit.hit && hit.kind === 'player' && playerCtx?.onPlayerHit) {
+                        playerCtx.onPlayerHit(playerCtx.inVehicle ? hit.damage * 0.22 : hit.damage * 0.45);
+                      }
+
+                      if (ag.ammoInMag <= 0) {
+                        ag.reloadTimer = wSpec.reloadSec;
+                        ag.burstShotsLeft = 0;
+                      }
+                    }
+                  } else {
+                    ag.burstCooldown -= safeDt;
+                    if (ag.burstCooldown <= 0) {
+                      ag.burstShotsLeft = Math.max(1, wSpec.burstCount);
+                      ag.burstShotTimer = 0;
+                      if (wSpec.pumpCycleSec > 0) {
+                        // Pump shotgun paces strictly by its ~0.9 Hz pump cycle
+                        ag.burstCooldown = wSpec.pumpCycleSec;
+                      } else if (wSpec.burstCooldownSec > 0) {
+                        ag.burstCooldown =
+                          Math.max(0.45, wSpec.burstCooldownSec - hiddenHeat * 0.004) +
+                          (ag.memberSlot % 3) * 0.18;
+                      } else {
+                        ag.burstCooldown = 0;
+                      }
+                    }
                   }
                 }
-              } else {
-                ag.burstCooldown -= safeDt;
-                if (ag.burstCooldown <= 0) {
-                  ag.burstShotsLeft = SHARED_WEAPON_SPEC.burstCount;
-                  ag.burstShotTimer = 0;
-                  ag.burstCooldown =
-                    Math.max(0.45, SHARED_WEAPON_SPEC.burstCooldownSec - hiddenHeat * 0.004) +
-                    (ag.memberSlot % 3) * 0.18;
-                }
               }
+            } else {
+              ag.aimPitch = THREE.MathUtils.damp(ag.aimPitch, 0, 6.0, safeDt);
             }
           } else if (ag.suspicion > 0.12 && playerPos) {
             // Glance toward player while suspicious
-            ag.heading = Math.atan2(playerPos.x - ag.x, playerPos.z - ag.z);
+            const toPx = playerPos.x - ag.x;
+            const toPz = playerPos.z - ag.z;
+            const pDist = Math.hypot(toPx, toPz);
+            ag.heading = Math.atan2(toPx, toPz);
+            const eyeY = ag.y + 1.44 * ag.heightScale;
+            const desiredPitch = THREE.MathUtils.clamp(
+              Math.atan2(playerPos.y + 1.15 - eyeY, Math.max(0.5, pDist)),
+              -0.45,
+              0.45
+            );
+            ag.aimPitch = THREE.MathUtils.damp(ag.aimPitch, desiredPitch, 8.0, safeDt);
             ag.aiming = ag.suspicion > 0.65;
+          } else {
+            ag.aimPitch = THREE.MathUtils.damp(ag.aimPitch, 0, 6.0, safeDt);
+          }
+
+          // Drive enemy weapon state machine & red LED warm-up ramp (patrol -> draw -> aim -> fire -> low_ready -> reload)
+          const sinceShot = elapsed - ag.lastShotElapsed;
+          const fireHoldSec = wSpec.pumpCycleSec > 0 ? 0.35 : 0.18;
+          if (ag.reloadTimer > 0) {
+            ag.weaponState = 'reload';
+            ag.ledTarget = 0.14;
+          } else if (ag.hadFireLos && (ag.burstShotsLeft > 0 || sinceShot < fireHoldSec)) {
+            ag.weaponState = 'fire';
+            ag.ledTarget = 1.15;
+          } else if (ag.hadFireLos && ag.drawFrac >= 0.72) {
+            // Break aim briefly to low-ready right after a carbine burst finishes, then re-acquire
+            const postBurstBreak =
+              !wSpec.sustainedFire &&
+              wSpec.burstCooldownSec > 0 &&
+              sinceShot >= 0.22 &&
+              sinceShot < 1.6 &&
+              ag.burstCooldown > 0.52;
+            if (postBurstBreak) {
+              ag.weaponState = 'low_ready';
+              ag.ledTarget = 0.34;
+            } else {
+              ag.weaponState = 'aim';
+              const denom = Math.max(0.2, wSpec.burstCooldownSec || wSpec.pumpCycleSec || 1.0);
+              const chargeFrac = 1.0 - THREE.MathUtils.clamp(ag.burstCooldown / denom, 0, 1);
+              ag.ledTarget = 0.72 + 0.26 * chargeFrac;
+            }
+          } else if (ag.aiming && ag.drawFrac >= 0.72) {
+            ag.weaponState = 'aim';
+            const suspAim = THREE.MathUtils.clamp((ag.suspicion - 0.65) / 0.35, 0, 1);
+            ag.ledTarget = 0.60 + 0.32 * suspAim;
+          } else if (crew.state === 'alert' || crew.state === 'search') {
+            if (ag.drawFrac < 0.72) {
+              ag.weaponState = 'draw';
+              ag.ledTarget = 0.32 + 0.34 * ag.drawFrac;
+            } else {
+              // Moving/searching or lost line-of-sight: drop to low-ready and decay red LED
+              ag.weaponState = 'low_ready';
+              ag.ledTarget = crew.state === 'alert' ? 0.22 : 0.08;
+            }
+          } else if (ag.suspicion > 0.03) {
+            ag.weaponState = ag.suspicion > 0.28 ? 'draw' : 'patrol';
+            ag.ledTarget = 0.14 + 0.46 * ag.suspicion;
+          } else {
+            ag.weaponState = 'patrol';
+            ag.ledTarget = 0.0;
           }
         }
       } else if (ag.role === 'sidewalk') {
@@ -1941,16 +2256,21 @@ export function buildPedestrianSystem(
         setPart(briefcaseInst, i, 0, -100, 0, 0, 0, 0, 0.001, 0.001, 0.001);
         const gv = gangVisuals.get(i);
         if (gv) {
-          gv.weapon.visible = false;
+          gv.carbine.root.visible = false;
+          gv.carbine.flashGroup.visible = false;
+          gv.carbine.ledGlowSprite.visible = false;
           gv.suspicionSprite.visible = false;
         }
         continue;
       }
       ag.sidestepYaw = THREE.MathUtils.damp(ag.sidestepYaw, ag.targetSidestep, 9.5, safeDt);
       const isWalking = walkingFlags[i] === 1;
+      const moveSpeed = Math.hypot(ag.vx, ag.vz);
 
       if (isWalking) {
-        ag.stridePhase += safeDt * ag.speed * 5.2;
+        // Scale stride cadence with true ground speed so running armed enemies pump legs cleanly (no statue-glide)
+        const strideRate = Math.max(ag.speed, Math.min(5.6, moveSpeed));
+        ag.stridePhase += safeDt * strideRate * 4.8;
       }
 
       const h = ag.heightScale;
@@ -2003,10 +2323,42 @@ export function buildPedestrianSystem(
           : lArmX - 0.22 - Math.max(0, -lArmX) * 0.46;
       const rForearmX = rArmX - 0.24 - Math.max(0, -rArmX) * 0.46;
 
-      // Head glare toward bumper when upset, or polite nod on passing
+      const isGang = ag.role === 'gang';
+      const wProf = isGang ? getEnemyWeaponClassProfile(ag.weaponClass) : null;
+      if (isGang && wProf) {
+        const ws = ag.weaponState;
+        const targetDraw = ws === 'patrol' ? 0.0 : 1.0;
+        const targetAim = ws === 'aim' || ws === 'fire' ? 1.0 : 0.0;
+        const targetLowReady = ws === 'low_ready' ? 1.0 : ws === 'draw' ? 0.65 : 0.0;
+        const targetTwoHand = ws === 'patrol' ? 0.0 : 1.0;
+        const targetReload = ws === 'reload' ? 1.0 : 0.0;
+
+        ag.drawFrac = THREE.MathUtils.damp(
+          ag.drawFrac,
+          targetDraw,
+          ws === 'patrol' ? wProf.blendRate * 0.85 : wProf.blendRate,
+          safeDt
+        );
+        ag.aimBlend = THREE.MathUtils.damp(ag.aimBlend, targetAim, wProf.blendRate, safeDt);
+        ag.lowReadyBlend = THREE.MathUtils.damp(ag.lowReadyBlend, targetLowReady, wProf.blendRate * 0.9, safeDt);
+        ag.twoHandBlend = THREE.MathUtils.damp(ag.twoHandBlend, targetTwoHand, wProf.blendRate * 1.1, safeDt);
+        ag.reloadBlend = THREE.MathUtils.damp(ag.reloadBlend, targetReload, 10.0, safeDt);
+        ag.recoilKick = THREE.MathUtils.damp(ag.recoilKick, 0, wProf.recoilDamp, safeDt);
+      }
+
+      const gangCombatBlend = isGang
+        ? Math.max(ag.aimBlend, ag.lowReadyBlend, ag.reloadBlend)
+        : 0;
+
+      // Head glare toward bumper when upset, track combat target when armed, or polite nod on passing
       let headYaw = ag.heading;
       let headPitch = 0;
-      if (ag.upsetTimer > 0) {
+      if (isGang && gangCombatBlend > 0.04) {
+        const patrolLook = Math.tanh(Math.sin(elapsed * 0.42 + ag.idlePhase) * 1.8) * 0.12;
+        headYaw = ag.heading + patrolLook * (1 - gangCombatBlend);
+        headPitch =
+          (-ag.aimPitch * 0.72 + 0.05 * ag.aimBlend - ag.recoilKick * 0.03) * gangCombatBlend;
+      } else if (ag.upsetTimer > 0) {
         let glareDelta = ((ag.upsetLookYaw - ag.heading + Math.PI) % (Math.PI * 2)) - Math.PI;
         if (glareDelta < -Math.PI) glareDelta += Math.PI * 2;
         headYaw = ag.heading + THREE.MathUtils.clamp(glareDelta, -1.15, 1.15) * Math.min(1, upsetFrac * 1.4);
@@ -2022,7 +2374,10 @@ export function buildPedestrianSystem(
         }
       }
 
-      const torsoYaw = ag.heading - stride * 0.09 + idleShift * 0.03 + ag.sidestepYaw;
+      // Blade torso into tactical stance & counter-stabilize walk twist while aiming/firing on the move
+      const walkTwist = -stride * 0.09 * (isGang ? 1 - ag.aimBlend * 0.82 : 1);
+      const stanceBlade = isGang && wProf ? -wProf.stanceYaw * gangCombatBlend : 0;
+      const torsoYaw = ag.heading + walkTwist + idleShift * 0.03 + ag.sidestepYaw + stanceBlade;
 
       const baseY = ag.y + bob;
       const hipY = baseY + 0.89 * h;
@@ -2121,13 +2476,21 @@ export function buildPedestrianSystem(
         b * 1.04
       );
 
+      const torsoPitch =
+        (isWalking ? 0.045 : 0.012) +
+        (isGang && wProf
+          ? wProf.combatLean * gangCombatBlend -
+            ag.aimPitch * 0.18 * ag.aimBlend -
+            ag.recoilKick * 0.075
+          : 0);
+
       setPart(
         torsoInst,
         i,
         bodyX,
         baseY + 1.01 * h,
         bodyZ,
-        isWalking ? 0.045 : 0.012,
+        torsoPitch,
         torsoYaw,
         idleShift * 0.028,
         b,
@@ -2161,103 +2524,230 @@ export function buildPedestrianSystem(
         ag.hasProp &&
         ag.civClass !== 'streetwear_youth' &&
         ag.civClass !== 'student_runner';
-      const isGang = ag.role === 'gang';
-      const rArmFinalX = isGang
-        ? ag.aiming
-          ? -1.24
-          : -0.36
-        : isCarryingBriefcase
-        ? rArmX * 0.25 + 0.05
-        : rArmX;
-      const rForearmFinalX = isGang
-        ? ag.aiming
-          ? -1.56
-          : -0.82
-        : isCarryingBriefcase
-        ? rArmFinalX - 0.12
-        : rForearmX;
-
       const shoulderY = baseY + 1.43 * h;
-      setPart(
-        leftUpperArmInst,
-        i,
-        bodyX - rightTX * armOff,
-        shoulderY,
-        bodyZ - rightTZ * armOff,
-        lArmX,
-        torsoYaw,
-        0.048,
-        b,
-        h,
-        b
-      );
-      setPart(
-        rightUpperArmInst,
-        i,
-        bodyX + rightTX * armOff,
-        shoulderY,
-        bodyZ + rightTZ * armOff,
-        rArmFinalX,
-        torsoYaw,
-        -0.048,
-        b,
-        h,
-        b
-      );
+      const fArmLen = 0.255 * h;
 
+      // Natural civilian / base arm FK positions (used directly for civilians & blended for patrol left arm)
       const lElbFwd = -Math.sin(lArmX) * uArmLen;
       const lElbY = shoulderY - Math.cos(lArmX) * uArmLen;
-      const rElbFwd = -Math.sin(rArmFinalX) * uArmLen;
-      const rElbY = shoulderY - Math.cos(rArmFinalX) * uArmLen;
-
-      setPart(
-        leftForearmInst,
-        i,
-        bodyX - rightTX * (armOff + 0.012 * b) + sinT * lElbFwd,
-        lElbY,
-        bodyZ - rightTZ * (armOff + 0.012 * b) + cosT * lElbFwd,
-        lForearmX,
-        torsoYaw,
-        0.025,
-        b,
-        h,
-        b
-      );
-      setPart(
-        rightForearmInst,
-        i,
-        bodyX + rightTX * (armOff + 0.012 * b) + sinT * rElbFwd,
-        rElbY,
-        bodyZ + rightTZ * (armOff + 0.012 * b) + cosT * rElbFwd,
-        rForearmFinalX,
-        torsoYaw,
-        -0.025,
-        b,
-        h,
-        b
-      );
-
-      const fArmLen = 0.255 * h;
       const lHandFwd = lElbFwd - Math.sin(lForearmX) * fArmLen;
       const lHandY = lElbY - Math.cos(lForearmX) * fArmLen;
       const lHandX = bodyX - rightTX * (armOff + 0.016 * b) + sinT * lHandFwd;
       const lHandZ = bodyZ - rightTZ * (armOff + 0.016 * b) + cosT * lHandFwd;
 
+      const rArmFinalX = isCarryingBriefcase ? rArmX * 0.25 + 0.05 : rArmX;
+      const rForearmFinalX = isCarryingBriefcase ? rArmFinalX - 0.12 : rForearmX;
+      const rElbFwd = -Math.sin(rArmFinalX) * uArmLen;
+      const rElbY = shoulderY - Math.cos(rArmFinalX) * uArmLen;
       const rHandFwd = rElbFwd - Math.sin(rForearmFinalX) * fArmLen;
       const rHandY = rElbY - Math.cos(rForearmFinalX) * fArmLen;
       const rHandX = bodyX + rightTX * (armOff + 0.016 * b) + sinT * rHandFwd;
       const rHandZ = bodyZ + rightTZ * (armOff + 0.016 * b) + cosT * rHandFwd;
 
-      setPart(leftHandInst, i, lHandX, lHandY, lHandZ, lForearmX, torsoYaw, 0.04, h, h, h);
-      setPart(rightHandInst, i, rHandX, rHandY, rHandZ, rForearmFinalX, torsoYaw, -0.04, h, h, h);
-
-      // Sync gang member's shared weapon & filling "?" suspicion sprite above head
-      if (isGang) {
+      if (isGang && wProf) {
         const gv = gangVisuals.get(i);
+        const moveNorm = Math.min(1.15, moveSpeed / 4.8);
+        const swayX =
+          Math.sin(elapsed * 2.1 + ag.idlePhase * 1.7) * 0.008 * wProf.swayAmp +
+          Math.sin(ag.stridePhase * 0.5) * 0.006 * moveNorm;
+        const swayY =
+          Math.cos(elapsed * 1.85 + ag.idlePhase) * 0.006 * wProf.swayAmp -
+          Math.abs(stride) * 0.010 * moveNorm;
+
+        // Weapon-specific reload choreography (duration strictly equals wSpec.reloadSec)
+        const wSpec = getSharedWeaponSpec(ag.weaponId);
+        const relW = ag.reloadBlend;
+        if (ag.reloadTimer > 0 && gv) {
+          const reloadU = 1.0 - ag.reloadTimer / wSpec.reloadSec;
+          evaluateReloadChoreography(reloadU, _relHandLocal, _relMagOffset, _relTilt, ag.weaponId);
+          // Mirror X because in pedestrianSystem character-left is +X in weapon space
+          setEnemyCarbineMagOffset(
+            gv.carbine,
+            -_relMagOffset.x,
+            _relMagOffset.y,
+            _relMagOffset.z,
+            _relMagOffset.y * 1.4,
+            -_relMagOffset.x * 2.2
+          );
+          if (ag.weaponId === 'pump_shotgun' && _relTilt.pumpStroke !== undefined) {
+            setEnemyWeaponPumpStroke(gv.carbine, _relTilt.pumpStroke);
+          }
+        } else {
+          if (gv) setEnemyCarbineMagOffset(gv.carbine, 0, 0, 0, 0, 0);
+          _relTilt.roll = 0;
+          _relTilt.pitch = 0;
+          _relTilt.yaw = 0;
+          _relTilt.impulse = 0;
+          _relTilt.pumpStroke = 0;
+        }
+
+        // Compute world weapon grip pose blending smoothly: patrol (1-hand low-carry) -> low-ready -> aim/fire
+        const drawW = ag.drawFrac;
+        const aimW = ag.aimBlend;
+        const recoil = ag.recoilKick;
+
+        // Patrol: comfortable one-handed low-carry at right hip/thigh, swaying subtly with right arm
+        const patLat = 0.225 * b;
+        const patY = baseY + 0.96 * h + Math.abs(stride) * 0.014 * h;
+        const patFwd = 0.125 - stride * 0.065;
+
+        // Low-ready: two-handed across upper chest, barrel safely dipped
+        const lrLat = 0.135 * b;
+        const lrY = baseY + 1.24 * h;
+        const lrFwd = 0.205;
+
+        // Shouldered aim/fire: buttpad seated in right shoulder pocket, visual muzzle at ag.y + 1.38*h
+        const aimLat = 0.175 * b;
+        const aimY = baseY + (1.340 + Math.sin(ag.aimPitch) * 0.045) * h;
+        const aimFwd = 0.145 - recoil * 0.044 + _relTilt.impulse * 0.018;
+
+        const gLat = THREE.MathUtils.lerp(THREE.MathUtils.lerp(patLat, lrLat, drawW), aimLat, aimW) + swayX;
+        const gY =
+          THREE.MathUtils.lerp(THREE.MathUtils.lerp(patY, lrY, drawW), aimY, aimW) +
+          swayY +
+          recoil * 0.015 -
+          relW * 0.036;
+        const gFwd =
+          THREE.MathUtils.lerp(THREE.MathUtils.lerp(patFwd, lrFwd, drawW), aimFwd, aimW) +
+          relW * 0.025;
+
+        _gunPos.set(
+          bodyX + rightX * gLat + sinH * gFwd,
+          gY,
+          bodyZ + rightZ * gLat + cosH * gFwd
+        );
+
+        const gPitchPatrol = 0.78 + stride * 0.09;
+        const gPitchLowReady = wProf.lowReadyPitch + swayY * 1.4;
+        const gPitchAim = -ag.aimPitch - recoil * 0.115 + swayY * 0.8;
+        const gPitch =
+          THREE.MathUtils.lerp(
+            THREE.MathUtils.lerp(gPitchPatrol, gPitchLowReady, drawW),
+            gPitchAim,
+            aimW
+          ) +
+          _relTilt.pitch * relW;
+
+        const gYawPatrol = ag.heading - 0.10;
+        const gYawLowReady = ag.heading + 0.22;
+        const gYawAim = ag.heading + swayX * 1.1;
+        const gYaw =
+          THREE.MathUtils.lerp(
+            THREE.MathUtils.lerp(gYawPatrol, gYawLowReady, drawW),
+            gYawAim,
+            aimW
+          ) -
+          _relTilt.yaw * relW;
+
+        const gRollPatrol = -0.14;
+        const gRollReady = -wProf.weaponCant + recoil * 0.045;
+        const gRoll =
+          THREE.MathUtils.lerp(gRollPatrol, gRollReady, drawW) - _relTilt.roll * relW;
+
+        _gunEuler.set(gPitch, gYaw, gRoll, 'YXZ');
+        _gunQuat.setFromEuler(_gunEuler);
+
+        // 1. Right arm 3D 2-bone IK locked directly onto the carbine pistol grip (zero floating!)
+        _rShPos.set(bodyX + rightTX * armOff, shoulderY, bodyZ + rightTZ * armOff);
+        _tmpOffset.set(0, -0.022, -0.012).applyQuaternion(_gunQuat);
+        _rHandTarget.copy(_gunPos).add(_tmpOffset);
+        _rPoleHint.set(
+          rightTX * 0.72 - sinT * 0.36,
+          -0.68,
+          rightTZ * 0.72 - cosT * 0.36
+        );
+        solveInstancedArmIK(
+          rightUpperArmInst,
+          rightForearmInst,
+          rightHandInst,
+          i,
+          _rShPos,
+          _rHandTarget,
+          _rPoleHint,
+          uArmLen,
+          fArmLen,
+          b,
+          h
+        );
+
+        // 2. Left (support) arm: natural walk/idle swing in patrol, 3D 2-bone IK onto handguard / reload mag in combat!
+        const suppW = ag.twoHandBlend;
+        if (suppW > 0.01) {
+          _lShPos.set(bodyX - rightTX * armOff, shoulderY, bodyZ - rightTZ * armOff);
+          _lHandBasePos.set(lHandX, lHandY, lHandZ);
+
+          const baseHandguardZ =
+            ag.weaponId === 'pump_shotgun' && gv
+              ? gv.carbine.pumpForendRestZ - gv.carbine.pumpStroke * 0.098
+              : 0.265;
+          if (relW > 0.02) {
+            _tmpOffset.set(
+              THREE.MathUtils.lerp(0.0, -_relHandLocal.x, relW),
+              THREE.MathUtils.lerp(0.002, _relHandLocal.y, relW),
+              THREE.MathUtils.lerp(baseHandguardZ, _relHandLocal.z, relW)
+            );
+          } else {
+            // Anchored directly beneath the carbine handguard or live sliding shotgun pump forend
+            _tmpOffset.set(0.0, 0.002, baseHandguardZ);
+          }
+          _tmpOffset.multiplyScalar(0.95).applyQuaternion(_gunQuat).add(_gunPos);
+          _lHandTarget.copy(_lHandBasePos).lerp(_tmpOffset, suppW);
+
+          _lPoleHint.set(
+            -rightTX * 0.65 - sinT * 0.24,
+            -0.78,
+            -rightTZ * 0.65 - cosT * 0.24
+          );
+          solveInstancedArmIK(
+            leftUpperArmInst,
+            leftForearmInst,
+            leftHandInst,
+            i,
+            _lShPos,
+            _lHandTarget,
+            _lPoleHint,
+            uArmLen,
+            fArmLen,
+            b,
+            h
+          );
+        } else {
+          // One-handed patrol low-carry: left arm swings completely naturally with gait
+          setPart(
+            leftUpperArmInst,
+            i,
+            bodyX - rightTX * armOff,
+            shoulderY,
+            bodyZ - rightTZ * armOff,
+            lArmX,
+            torsoYaw,
+            0.048,
+            b,
+            h,
+            b
+          );
+          setPart(
+            leftForearmInst,
+            i,
+            bodyX - rightTX * (armOff + 0.012 * b) + sinT * lElbFwd,
+            lElbY,
+            bodyZ - rightTZ * (armOff + 0.012 * b) + cosT * lElbFwd,
+            lForearmX,
+            torsoYaw,
+            0.025,
+            b,
+            h,
+            b
+          );
+          setPart(leftHandInst, i, lHandX, lHandY, lHandZ, lForearmX, torsoYaw, 0.04, h, h, h);
+        }
+
+        // Sync black enemy carbine transform, red LED power-up & muzzle flash, plus "?" suspicion sprite
         if (gv) {
-          gv.weapon.visible = true;
-          gv.weapon.position.set(rHandX, rHandY + 0.015 * h, rHandZ);
-          gv.weapon.rotation.set(rForearmFinalX + Math.PI * 0.5, torsoYaw, 0, 'YXZ');
+          gv.carbine.root.visible = true;
+          gv.carbine.root.position.copy(_gunPos);
+          gv.carbine.root.quaternion.copy(_gunQuat);
+          updateEnemyCarbineVisual(gv.carbine, safeDt, elapsed, ag.ledTarget, ag.idlePhase);
 
           const crew = crews[ag.crewIdx];
           if (ag.alertBannerTimer > 0 && crew?.state === 'alert') {
@@ -2276,6 +2766,62 @@ export function buildPedestrianSystem(
             gv.suspicionSprite.visible = false;
           }
         }
+      } else {
+        // Non-gang unarmed civilians: original exact FK placement untouched
+        setPart(
+          leftUpperArmInst,
+          i,
+          bodyX - rightTX * armOff,
+          shoulderY,
+          bodyZ - rightTZ * armOff,
+          lArmX,
+          torsoYaw,
+          0.048,
+          b,
+          h,
+          b
+        );
+        setPart(
+          rightUpperArmInst,
+          i,
+          bodyX + rightTX * armOff,
+          shoulderY,
+          bodyZ + rightTZ * armOff,
+          rArmFinalX,
+          torsoYaw,
+          -0.048,
+          b,
+          h,
+          b
+        );
+        setPart(
+          leftForearmInst,
+          i,
+          bodyX - rightTX * (armOff + 0.012 * b) + sinT * lElbFwd,
+          lElbY,
+          bodyZ - rightTZ * (armOff + 0.012 * b) + cosT * lElbFwd,
+          lForearmX,
+          torsoYaw,
+          0.025,
+          b,
+          h,
+          b
+        );
+        setPart(
+          rightForearmInst,
+          i,
+          bodyX + rightTX * (armOff + 0.012 * b) + sinT * rElbFwd,
+          rElbY,
+          bodyZ + rightTZ * (armOff + 0.012 * b) + cosT * rElbFwd,
+          rForearmFinalX,
+          torsoYaw,
+          -0.025,
+          b,
+          h,
+          b
+        );
+        setPart(leftHandInst, i, lHandX, lHandY, lHandZ, lForearmX, torsoYaw, 0.04, h, h, h);
+        setPart(rightHandInst, i, rHandX, rHandY, rHandZ, rForearmFinalX, torsoYaw, -0.04, h, h, h);
       }
 
       const headY = baseY + 1.59 * h;

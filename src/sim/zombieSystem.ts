@@ -221,6 +221,33 @@ export function buildZombieSystem(
   const root = new THREE.Group();
   root.name = 'ZombieSystem';
 
+  // Hard invariant: zombies are strictly unarmed melee enemies and must never receive a weapon
+  function assertZombieUnarmed(agRoot: THREE.Object3D, agentId: number): void {
+    const illegal: THREE.Object3D[] = [];
+    agRoot.traverse((obj) => {
+      if (
+        obj !== agRoot &&
+        (obj.userData?.isWeapon === true ||
+          obj.name === 'SharedServiceCarbine' ||
+          obj.name === 'SharedFullAutoCarbine' ||
+          obj.name === 'SharedPumpShotgun' ||
+          obj.name === 'EnemyBlackServiceCarbine' ||
+          obj.name === 'EnemyBlackFullAutoCarbine' ||
+          obj.name === 'EnemyBlackPumpShotgun' ||
+          obj.name === 'NpcWeaponGripPivot')
+      ) {
+        illegal.push(obj);
+      }
+    });
+    for (let k = 0; k < illegal.length; k++) {
+      const node = illegal[k];
+      node.parent?.remove(node);
+      console.error(
+        `[ZombieSystem] Blocked illegal weapon attachment "${node.name}" on Zombie_${agentId}: zombies must remain strictly unarmed.`
+      );
+    }
+  }
+
   const agents: ZombieAgent[] = [];
   const audioPools = new Map<ZombieAudioKey, HTMLAudioElement[]>();
   const lastAudioTime: Partial<Record<ZombieAudioKey, number>> = {};
@@ -372,6 +399,7 @@ export function buildZombieSystem(
     const sp = planned[i];
     const agRoot = new THREE.Group();
     agRoot.name = `Zombie_${i}`;
+    agRoot.userData.unarmedOnly = true;
     agRoot.position.set(sp.x, sp.y, sp.z);
     agRoot.rotation.y = rng() * Math.PI * 2;
     agRoot.visible = !sp.dormant;
@@ -380,6 +408,7 @@ export function buildZombieSystem(
     proxy.position.y = 0.85;
     proxy.name = 'ZombieProxy';
     agRoot.add(proxy);
+    assertZombieUnarmed(agRoot, i);
     root.add(agRoot);
 
     agents.push({
@@ -474,6 +503,7 @@ export function buildZombieSystem(
         // Align feet cleanly onto y = 0
         clone.position.set(0, -box.min.y * normScale, 0);
         ag.root.add(clone);
+        assertZombieUnarmed(ag.root, ag.id);
 
         const mixer = new THREE.AnimationMixer(clone);
         ag.mixer = mixer;
@@ -599,6 +629,9 @@ export function buildZombieSystem(
     // Update each active zombie
     for (const ag of agents) {
       if (ag.dormant) continue;
+      if (ag.root.children.length > 1) {
+        assertZombieUnarmed(ag.root, ag.id);
+      }
 
       if (ag.spotCooldown > 0) ag.spotCooldown -= safeDt;
 
