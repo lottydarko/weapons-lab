@@ -33,6 +33,8 @@ This is one simulation of armed men, shared by every enemy class in the city. A 
 6. **Class discipline (visual only):** guards/soldiers — crisp, minimal movement; mob enforcers — slower, heavier stance; gang/bandits — looser, more sway. Same mechanics, different posture parameters.
 7. **Weapon finish + red warm-up light (Lotty, Nov 27):** enemy carbines are **black** — a simple material color change on the existing carbine mesh, no new model, no texture work. Each enemy weapon carries a small **red light** element (sight/light housing on the gun). The light is the warm-up readout, driven by the enemy's existing detection/aim ramp (the same fill that drives the "?" over a gang member): dark in patrol-carry → dim red on acquire → brightening through aim → full red at the moment of fire → decays back at low-ready. It is a light on the gun, not a HUD element and not a laser beam. This is how the player reads an enemy who is about to shoot.
 
+8. **Armed locomotion (Lotty, Nov 27):** the hold layer blends over walk AND run — an enemy can advance, retreat, and reposition while aiming and firing. Upper body stays in the aim/fire state; lower body keeps its locomotion cycle; no foot-lock, no statue-glide. Firing while running is allowed by the existing burst logic — make it visible: recoil reads through the moving stance, muzzle stays on the true fire line.
+
 **Proof required (your report back):**
 - Day stills: one enemy in each state — patrol-carry, aim, fire (muzzle flash visible at the gun), reload — plus one crowd-cost line: frame cost with 40 armed NPCs active.
 - A 3-line report: what you added, which poses you layered, any place the rig fought you.
